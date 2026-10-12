@@ -1,26 +1,21 @@
 package com.bhusadukan.service;
 
-import com.bhusadukan.dto.CreateOrderItemRequest;
-import com.bhusadukan.dto.CreateOrderRequest;
-import com.bhusadukan.dto.OrderItemResponse;
-import com.bhusadukan.dto.OrderResponse;
-import com.bhusadukan.entity.CustomerAddress;
-import com.bhusadukan.entity.Inventory;
-import com.bhusadukan.entity.Order;
+import com.bhusadukan.dto.*;
+import com.bhusadukan.entity.*;
+import com.bhusadukan.repository.*;
+import com.bhusadukan.security.CurrentUser;
+import com.bhusadukan.dto.UpdateActualWeightRequest;
 import com.bhusadukan.entity.OrderItem;
-import com.bhusadukan.entity.Product;
-import com.bhusadukan.entity.ProductPrice;
-import com.bhusadukan.entity.User;
-import com.bhusadukan.repository.CustomerAddressRepository;
-import com.bhusadukan.repository.InventoryRepository;
-import com.bhusadukan.repository.OrderRepository;
-import com.bhusadukan.repository.ProductPriceRepository;
-import com.bhusadukan.repository.ProductRepository;
-import com.bhusadukan.repository.UserRepository;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.annotation.Transactional;
+import com.bhusadukan.entity.Payment;
+import com.bhusadukan.repository.PaymentRepository;
+import org.springframework.transaction.annotation.Transactional;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-
+import org.springframework.security.access.AccessDeniedException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
@@ -41,19 +36,28 @@ public class OrderService {
     private final ProductPriceRepository productPriceRepository;
     private final InventoryRepository inventoryRepository;
     private final OrderRepository orderRepository;
+    private final OrderStatusHistoryRepository orderStatusHistoryRepository;
+    private final PaymentRepository paymentRepository;
+    private final CurrentUser currentUser;
+    private final OrderItemRepository orderItemRepository;
+
 
     @Transactional
     public OrderResponse createOrder(CreateOrderRequest request) {
 
-        // 1. Validate customer
-        User customer = userRepository.findById(request.customerId())
+        // Get the customer ID from the authenticated JWT.
+        Long authenticatedUserId = currentUser.getUserId();
+
+        // Validate the authenticated user as an active customer.
+        User customer = userRepository.findById(authenticatedUserId)
                 .filter(user -> user.getRole() == User.Role.CUSTOMER)
-                .filter(User::getActive)
+                .filter(user -> Boolean.TRUE.equals(user.getActive()))
                 .orElseThrow(() ->
                         new IllegalArgumentException(
-                                "Customer not found: " + request.customerId()
-                        )
-                );
+                                "Active customer account not found"));
+
+        // Continue with the existing delivery-address validation,
+        // inventory reservation, pricing and order creation logic.
 
         // 2. Validate delivery address
         CustomerAddress address =
@@ -199,26 +203,71 @@ public class OrderService {
         // 13. Connect items to order
         orderItems.forEach(orderItem -> orderItem.setOrder(order));
         order.setItems(orderItems);
+
         Order savedOrder = orderRepository.save(order);
+        Payment payment = Payment.builder()
+                .order(savedOrder)
+                .paymentMethod(request.paymentMethod())
+                .paymentStatus(Payment.PaymentStatus.PENDING)
+                .amount(savedOrder.getFinalAmount())
+                .build();
+
+        paymentRepository.save(payment);
+
+        OrderStatusHistory initialHistory = OrderStatusHistory.builder()
+                .order(savedOrder)
+                .oldStatus(null)
+                .newStatus(Order.OrderStatus.PLACED)
+                .changedBy(null)
+                .remarks("Order placed")
+                .build();
+
+        orderStatusHistoryRepository.save(initialHistory);
+
+        return toResponse(savedOrder, orderItems);
 
         // 15. Save order items
         // We save through EntityManager cascade later.
         // For now this is handled by OrderItemRepository in next refinement.
 
-        return toResponse(savedOrder, orderItems);
+    }
+
+    @Transactional(readOnly = true)
+    public List<OrderResponse> getCustomerOrders(Long customerId) {
+
+        Long authenticatedUserId = currentUser.getUserId();
+
+        if (!authenticatedUserId.equals(customerId)) {
+            User.Role role = userRepository.findById(authenticatedUserId)
+                    .map(User::getRole)
+                    .orElseThrow(() ->
+                            new org.springframework.security.access.AccessDeniedException(
+                                    "User account not found"));
+
+            if (role != User.Role.ADMIN && role != User.Role.STAFF) {
+                throw new org.springframework.security.access.AccessDeniedException(
+                        "You cannot access another customer's orders");
+            }
+        }
+
+        User customer = userRepository.findById(customerId)
+                .filter(user -> user.getRole() == User.Role.CUSTOMER)
+                .filter(user -> Boolean.TRUE.equals(user.getActive()))
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Customer not found: " + customerId));
+
+        return orderRepository
+                .findByCustomerIdOrderByOrderedAtDesc(customer.getId())
+                .stream()
+                .map(order -> toResponse(order, order.getItems()))
+                .toList();
     }
 
     @Transactional(readOnly = true)
     public OrderResponse getOrder(Long orderId) {
-
-        Order order = orderRepository.findById(orderId)
-                .orElseThrow(() ->
-                        new IllegalArgumentException(
-                                "Order not found: " + orderId
-                        )
-                );
-
-        return toResponse(order, List.of());
+        Order order = getOrderForCurrentUser(orderId);
+        return toResponse(order, order.getItems());
     }
 
     private String generateOrderNumber() {
@@ -247,6 +296,20 @@ public class OrderService {
                         ))
                         .toList();
 
+        Payment.PaymentMethod paymentMethod = null;
+        Payment.PaymentStatus paymentStatus = null;
+
+        List<Payment> payments =
+                paymentRepository.findByOrderIdOrderByCreatedAtDesc(
+                        order.getId());
+
+        if (!payments.isEmpty()) {
+            Payment latestPayment = payments.get(0);
+
+            paymentMethod = latestPayment.getPaymentMethod();
+            paymentStatus = latestPayment.getPaymentStatus();
+        }
+
         return new OrderResponse(
                 order.getId(),
                 order.getOrderNumber(),
@@ -261,7 +324,212 @@ public class OrderService {
                 order.getFinalAmount(),
                 order.getCustomerNotes(),
                 order.getOrderedAt(),
+                paymentMethod,
+                paymentStatus,
                 itemResponses
         );
     }
+    @Transactional
+    public OrderResponse updateOrderStatus(
+            Long orderId,
+            UpdateOrderStatusRequest request) {
+
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Order not found: " + orderId));
+
+        Order.OrderStatus oldStatus = order.getStatus();
+        Order.OrderStatus newStatus = request.newStatus();
+
+        validateStatusTransition(oldStatus, newStatus);
+
+        order.setStatus(newStatus);
+
+        LocalDateTime now = LocalDateTime.now();
+
+        switch (newStatus) {
+            case CONFIRMED -> order.setConfirmedAt(now);
+            case DELIVERED -> order.setDeliveredAt(now);
+            case CANCELLED -> order.setCancelledAt(now);
+        }
+
+        if (newStatus == Order.OrderStatus.CANCELLED) {
+            order.setCancellationReason(request.remarks());
+        }
+
+        OrderStatusHistory history = OrderStatusHistory.builder()
+                .order(order)
+                .oldStatus(oldStatus)
+                .newStatus(newStatus)
+                .changedBy(
+                        request.changedBy() == null
+                                ? null
+                                : userRepository.findById(request.changedBy())
+                                .orElseThrow(() ->
+                                        new IllegalArgumentException(
+                                                "User not found: "
+                                                        + request.changedBy()))
+                )
+                .remarks(request.remarks())
+                .build();
+
+        orderStatusHistoryRepository.save(history);
+
+        Order savedOrder = orderRepository.save(order);
+
+        return toResponse(
+                savedOrder,
+                savedOrder.getItems()
+        );
+    }
+    private void validateStatusTransition(
+            Order.OrderStatus oldStatus,
+            Order.OrderStatus newStatus) {
+
+        if (oldStatus == newStatus) {
+            throw new IllegalArgumentException(
+                    "Order is already in status: " + newStatus);
+        }
+
+        if (oldStatus == Order.OrderStatus.CANCELLED
+                || oldStatus == Order.OrderStatus.DELIVERED) {
+
+            throw new IllegalArgumentException(
+                    "Order cannot be changed from " + oldStatus);
+        }
+
+        boolean valid = switch (oldStatus) {
+
+            case PLACED ->
+                    newStatus == Order.OrderStatus.CONFIRMED
+                            || newStatus == Order.OrderStatus.CANCELLED;
+
+            case CONFIRMED ->
+                    newStatus == Order.OrderStatus.WEIGHING
+                            || newStatus == Order.OrderStatus.CANCELLED;
+
+            case WEIGHING ->
+                    newStatus == Order.OrderStatus.PACKED
+                            || newStatus == Order.OrderStatus.CANCELLED;
+
+            case PACKED ->
+                    newStatus == Order.OrderStatus.OUT_FOR_DELIVERY
+                            || newStatus == Order.OrderStatus.CANCELLED;
+
+            case OUT_FOR_DELIVERY ->
+                    newStatus == Order.OrderStatus.DELIVERED;
+
+            case DELIVERED, CANCELLED ->
+                    false;
+        };
+
+        if (!valid) {
+            throw new IllegalArgumentException(
+                    "Invalid order status transition: "
+                            + oldStatus + " -> " + newStatus);
+        }
+    }
+    @Transactional(readOnly = true)
+    public List<OrderStatusHistoryResponse> getOrderStatusHistory(
+            Long orderId) {
+
+        getOrderForCurrentUser(orderId);
+
+        return orderStatusHistoryRepository
+                .findByOrderIdOrderByCreatedAtAsc(orderId)
+                .stream()
+                .map(history -> new OrderStatusHistoryResponse(
+                        history.getId(),
+                        history.getOldStatus() == null
+                                ? null
+                                : history.getOldStatus().name(),
+                        history.getNewStatus().name(),
+                        history.getChangedBy() == null
+                                ? null
+                                : history.getChangedBy().getId(),
+                        history.getRemarks(),
+                        history.getCreatedAt()
+                ))
+                .toList();
+    }
+
+    private Order getOrderForCurrentUser(Long orderId) {
+        Long authenticatedUserId = currentUser.getUserId();
+
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Order not found: " + orderId));
+
+        User.Role role = userRepository.findById(authenticatedUserId)
+                .map(User::getRole)
+                .orElseThrow(() ->
+                        new AccessDeniedException("User account not found"));
+
+        boolean isStaffOrAdmin =
+                role == User.Role.ADMIN || role == User.Role.STAFF;
+
+        boolean isOwner = order.getCustomer() != null
+                && authenticatedUserId.equals(
+                order.getCustomer().getId());
+
+        if (!isOwner && !isStaffOrAdmin) {
+            throw new AccessDeniedException(
+                    "You are not authorized to access this order");
+        }
+
+        return order;
+    }
+
+    @Transactional
+    public OrderResponse updateActualWeight(
+            Long orderId,
+            UpdateActualWeightRequest request) {
+
+        Long authenticatedUserId = currentUser.getUserId();
+
+        User.Role role = userRepository.findById(authenticatedUserId)
+                .map(User::getRole)
+                .orElseThrow(() ->
+                        new AccessDeniedException("User account not found"));
+
+        if (role != User.Role.ADMIN && role != User.Role.STAFF) {
+            throw new AccessDeniedException(
+                    "Only staff or admin can record actual weight");
+        }
+
+        Order order = orderRepository.findById(orderId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Order not found: " + orderId));
+
+        if (order.getStatus() != Order.OrderStatus.WEIGHING) {
+            throw new IllegalArgumentException(
+                    "Actual weight can only be recorded when order is in WEIGHING status");
+        }
+
+        OrderItem item = orderItemRepository.findById(request.orderItemId())
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Order item not found: " + request.orderItemId()));
+
+        if (item.getOrder() == null
+                || !order.getId().equals(item.getOrder().getId())) {
+            throw new IllegalArgumentException(
+                    "Order item does not belong to this order");
+        }
+
+        item.setActualQuantity(request.actualQuantity());
+
+        orderItemRepository.save(item);
+
+        Order savedOrder = orderRepository.findById(orderId)
+                .orElseThrow(() ->
+                        new IllegalArgumentException(
+                                "Order not found: " + orderId));
+
+        return toResponse(savedOrder, savedOrder.getItems());
+    }
+
 }
