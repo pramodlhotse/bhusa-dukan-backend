@@ -44,10 +44,18 @@ public class CustomerAuthController {
 
         return ResponseEntity.ok(response);
     }
+
     @PostMapping("/admin/users")
     @PreAuthorize("hasRole('ADMIN')")
-    public CustomerRegisterResponse createUser(
+    public ResponseEntity<CustomerRegisterResponse> createUser(
             @Valid @RequestBody AdminCreateUserRequest request) {
-        return customerAuthService.createUser(request);
+
+        CustomerRegisterResponse response =
+                customerAuthService.createUser(request);
+
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(response);
     }
+
 }
